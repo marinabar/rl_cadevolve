@@ -41,7 +41,7 @@ def compute_normals_metrics(gt_mesh, pred_mesh, tol=1, n_points=8192, visualize=
         valid_pred_points.append(pred_points[idxs[best_idx]])  # (3,)
 
     if len(valid_pred_normals) == 0:
-        return 1.0, 0.0, 100
+        return None, None, None
 
     valid_gt_normals = np.vstack(valid_gt_normals)
     valid_pred_normals = np.vstack(valid_pred_normals)
@@ -80,10 +80,6 @@ def compute_normals_metrics(gt_mesh, pred_mesh, tol=1, n_points=8192, visualize=
     #if aoc_normalized > 0.3:
         #print(f"HIGH aoc: {aoc_normalized:.2f}")
         #plot_aoc(angles, cdf, title='aoc of Normal Angles', aoc_value=aoc_normalized)
-
-
-    if visualize:
-        save_normals(valid_pred_normals, valid_gt_normals, valid_pred_points, valid_gt_points)
 
 
     return auc_normalized, mean_cos_sim, per_invalid

@@ -1,2 +1,6 @@
-./logs
-./models
+logs/
+models/
+dev/
+__pycache__
+*rendered*
+*test*

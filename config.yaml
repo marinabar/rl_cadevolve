@@ -15,7 +15,7 @@ gradient_accumulation_steps: 1
 max_completion_length: 1400
 
 num_completions_to_print: 5
-log_completions: true
+log_completions: false
 logging_steps: 30
 # valid if using one device, otherwise adjust generation_batch_size
 num_generations: 16
@@ -34,6 +34,7 @@ loss_type: dr_grpo
 epsilon: 0.1
 num_iterations: 3
 #steps_per_generation: 1
+scale_rewards: false
 
 learning_rate: 1e-5
 
@@ -41,3 +42,4 @@ learning_rate: 1e-5
 failure_reward: -10
 iou_coef: 10
 cd_coef: 0
+auc_coef: 0

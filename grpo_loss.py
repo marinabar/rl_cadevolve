@@ -7,14 +7,13 @@ from trl.trainer.grpo_trainer import nanmin, nanmax
 
 
 def adv_select_top_samples(self, inputs, num_generations: int, top_samples: int=TOP_SAMPLES):
-    prompt_ids, prompt_mask = inputs["prompt_ids"], inputs["prompt_mask"]
-    completion_ids, completion_mask = inputs["completion_ids"], inputs["completion_mask"]
+    completion_ids = inputs["completion_ids"]
     print(f"completion_ids shape {completion_ids.shape} ")
     G = self.num_generations
     B = completion_ids.size(0) # G * batch size per device / num_iterations --- 16 * 4 = 64
     assert B % G == 0, f"inputs must be B * num_generations, got B : {B} G : {G}"
     num_prompts = B // G
-    device = prompt_ids.device
+    device = completion_ids.device
 
     adv = inputs["advantages"].view(B, -1).squeeze(-1)        # (B,)
     abs_adv = adv.abs().view(num_prompts, G)              # (N, G)
@@ -31,17 +30,17 @@ def adv_select_top_samples(self, inputs, num_generations: int, top_samples: int=
             new_inputs[k] = None
             continue
         # pixel_values might be packed, handle separately
-        if k == "pixel_values":
+        if k == "pixel_values" or k == "pixel_values_videos":
             P = v.size(0) // B
             D = v.size(1)
-            new_inputs["pixel_values"] = v.view(B, P, D)[flat].reshape(-1, D)
+            new_inputs[k] = v.view(B, -1, D)[flat].reshape(-1, D)
         else:
             new_inputs[k] = take(v)
 
     return new_inputs
 
 
-def cppo_compute_loss(self, model, inputs, return_outputs=False):
+def cppo_compute_loss(self, model, inputs, return_outputs=False, clip_cov=False, has_videos = False):
         completion_ids_full = inputs["completion_ids"]
         logits_to_keep = completion_ids_full.size(1)  # we only need to compute the logits for the completion tokens
         
@@ -52,11 +51,10 @@ def cppo_compute_loss(self, model, inputs, return_outputs=False):
         input_ids = torch.cat([prompt_ids, completion_ids], dim=1)
         attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
         print(f"new completion_ids shape {completion_ids.shape}")
-        # ---- print one sample every 50 steps ----
-        self._maybe_print_sample(completion_ids)
         # ----------------------------------------
 
         # Compute the per_token_logps and the entropy at each position in the completion
+        
         per_token_logps, entropies = self._get_per_token_logps_and_entropies(
             model,
             input_ids,
@@ -67,6 +65,8 @@ def cppo_compute_loss(self, model, inputs, return_outputs=False):
             image_grid_thw=sel_inputs.get("image_grid_thw"),
             pixel_attention_mask=sel_inputs.get("pixel_attention_mask"),
             image_sizes=sel_inputs.get("image_sizes"),
+            video_grid_thw=sel_inputs.get("video_grid_thw"),
+            pixel_values_videos=sel_inputs.get("pixel_values_videos"),
         )
 
 
@@ -99,6 +99,22 @@ def cppo_compute_loss(self, model, inputs, return_outputs=False):
 
         per_token_loss1 = coef_1 * advantages.unsqueeze(1)
         per_token_loss2 = coef_2 * advantages.unsqueeze(1)
+        if clip_cov:
+            cov_lb = 1
+            cov_hb = 5
+            select_ratio = 2e-4
+            covs = (per_token_logps - per_token_logps.mean()) * (advantages.unsqueeze(1) - advantages.mean())
+            mask = (covs > cov_lb) & (covs < cov_hb)
+            all_idx = torch.nonzero(mask).reshape(-1)
+            select_num = int(select_ratio * per_token_logps.numel())
+
+            if all_idx.numel() >= select_num > 0:
+                perm= torch.randperm(all_idx.numel(), device=all_idx.device)
+                clip_idx = all_idx[perm[:select_num]]
+                # remove gradients from high entropy covariance tokens
+                per_token_loss1[clip_idx] = per_token_loss1[clip_idx].detach()
+                per_token_loss2[clip_idx] = per_token_loss2[clip_idx].detach()
+
         per_token_loss = -torch.min(per_token_loss1, per_token_loss2)
 
         
@@ -141,3 +157,5 @@ def cppo_compute_loss(self, model, inputs, return_outputs=False):
         gathered_clip_ratio = self.accelerator.gather(clip_ratio)
         self._metrics[mode]["clip_ratio/region_mean"].append(gathered_clip_ratio.nanmean().item())
         return loss
+
+
