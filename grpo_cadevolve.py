@@ -49,16 +49,27 @@ class RewardArgs:
     iou_coef: float = 10.0
     cd_coef: float = 0.0
     auc_coef: float = 0.0
-    gen_sample_steps: int = 25
+    get_nc: bool = False
+    # how many points to sample from surface
+    nc_n_points: int = 16384
+    # what percentage of overall mesh extents to look for neighbors in
+    nc_tol: int = 5
+    gen_sample_steps: int = 25 // 3
     pool_size: int = 16
-    adv_multiplier: int = 1
 
 @dataclass
 class ModelConfig:
     sft_path: str = "/workspace-SR008.nfs2/users/zhemchuzhnikov/iterative_generation/train/work_dirs/qwen2vl_image2code_stls_v2_aug_updated/final_model"
+    group_port: int = 51216
 
-parser = TrlParser((GRPOConfig, RewardArgs, ModelConfig))
-grpo, rargs, margs = parser.parse_args_and_config()
+@dataclass
+class TrainingArgs:
+    adv_multiplier: int = 1
+    clip_cov: bool = False
+
+
+parser = TrlParser((GRPOConfig, RewardArgs, ModelConfig, TrainingArgs))
+grpo, rargs, margs, targs = parser.parse_args_and_config()
 grpo.output_dir = "models/" + grpo.output_dir
 
 init_pool(rargs.pool_size)
@@ -67,7 +78,7 @@ sft_path = margs.sft_path
 
 torch.manual_seed(SEED)
 torch.cuda.manual_seed_all(SEED)
-processor = AutoProcessor.from_pretrained(MODEL_ID, padding_side="left", use_fast=True)
+processor = AutoProcessor.from_pretrained(MODEL_ID, padding_side="left", use_fast=True, trust_remote_code=True)
 
 processor.image_processor.do_resize = False
 processor.image_processor.do_center_crop = False
@@ -77,7 +88,8 @@ processor.image_processor.do_normalize = True
 model = Qwen2VLForConditionalGeneration.from_pretrained(
     pretrained_model_name_or_path=sft_path,
     torch_dtype=torch.bfloat16,
-    attn_implementation="flash_attention_2"
+    attn_implementation="flash_attention_2",
+    trust_remote_code=True, 
 )
 model.enable_input_require_grads() 
 
@@ -209,78 +221,124 @@ def reward_from_metrics(cd: float, iou: float, auc: float = 0, mode: str = "defa
         r = 10.0 * float(iou)
     return float(np.clip(r, -10.0, 10.0))
 
+def update_step_tol(step):
+    if step >= 250:
+        tol = 3
+    elif step >= 200:
+        tol = 3.5
+    elif step >= 150:
+        tol = 4
+    elif step >= 75:
+        tol = 4.5
+    else:
+        tol = nc_params["tol"]
+    #print(f"[tol] step {step}: tol={tol}")
+    return tol
 
-def get_reward_function(failure_reward, iou_coef=10, cd_coef=0, auc_coef=0):
+
+def reward_from_auc(auc, step, scale=10.0, eps=1e-8, tau=3e-3):
+    auc = np.asarray(auc, dtype=float)
+    z = np.clip((auc - 0.5) / 0.5, eps, 1 - eps)
+
+    # scheduler: ~1 before 50 (minimal), mild after 50, strong after 100
+    s = 1.0 \
+        + 0.6 / (1.0 + np.exp(-(step - 50) / 10.0)) \
+        + 1.6 / (1.0 + np.exp(-(step - 100) / 10.0))
+
+    base = scale * (0.5 + 0.5 * z**s)                        # power sharpening
+    # gate ensures rewards > 9.5 occur only when AUC > 0.975
+    gate = 1.0 / (1.0 + np.exp(-(auc - 0.975) / tau))
+
+    # ≤0.975: cap at 9.5 (don’t inflate mid-high AUCs)
+    below = auc <= 0.975
+    capped = np.where(below, np.minimum(base, 9.5), base)
+    # >0.975: reveal the portion above 9.5 smoothly
+    rewarded = np.where(below, capped, 9.5 + (base - 9.5) * gate)
+    return rewarded
+
+
+def get_reward_function(failure_reward, iou_coef=10, cd_coef=0, auc_coef=0, nc_params=None):
     def combined_reward(completions, mesh_path, trainer_state=None, **kwargs):
         # Get individual rewards
         rewards = []
         # excepts = []
+        if nc_params.get("get_nc") == True:
+            updt_tol = update_step_tol(step=getattr(trainer_state, "global_step", 0))
+            nc_params["tol"] = updt_tol
         pred_metrics = get_metrics_from_texts(
-            completions, mesh_path)
+            completions, mesh_path, nc_params)
         # print("MESHES", pred_meshes, flush=True)
         for m in pred_metrics:
             reward = 0
             iou = m["iou"] if m is not None else None
             cd =  m["cd"] if m is not None else None
-            auc =  m["auc"] if m is not None else Non
-            if cd is None:
+            auc =  m["auc"] if m is not None else None
+            if auc is None:
                 reward = failure_reward
             else:
-                reward = reward_from_metrics(cd, iou, mode="10_iou")
+                reward = reward_from_metrics(cd, iou, auc=auc, mode="10_normal_auc")
+                #reward = reward_from_auc(auc=auc, step=trainer_state.global_step)
             rewards.append(float(reward))
         print(f"Rewards : {rewards}\n\n\n")
+
+        # ---- print one sample every 50 steps ----
+        top_idx = rewards.index(max(rewards))
+        top_generation = completions[top_idx]
+        top_mesh_path = mesh_path[top_idx]
+        _maybe_print_sample(top_generation, top_mesh_path, step=trainer_state.global_step)
+
         return rewards
     return combined_reward
 
-reward_fn = get_reward_function(failure_reward=rargs.failure_reward, iou_coef=rargs.iou_coef, cd_coef=rargs.cd_coef, auc_coef=rargs.auc_coef)
+nc_params = {
+    "get_nc": rargs.get_nc,
+    "n_points" : rargs.nc_n_points, 
+    "tol" : rargs.nc_tol,
+}
 
-# -----------------------set up training parameters
 
+reward_fn = get_reward_function(failure_reward=rargs.failure_reward, iou_coef=rargs.iou_coef, cd_coef=rargs.cd_coef, auc_coef=rargs.auc_coef, nc_params=nc_params)
+
+# ------- training params
 optimizer = optim.AdamW(model.parameters(), lr=grpo.learning_rate)
 #lr_scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=30, gamma=0.1)
 lr_scheduler = None
 
 
-#----------- patch call to wandb bug
-GRPOTrainer.create_model_card = lambda self, **kw: None
+
+#----------- callback for generating samples
+def _maybe_print_sample(completion, mesh_path, step, every=rargs.gen_sample_steps):
+    if step == 0 or step % every != 0:
+        return
+    print(f"\n[SAMPLE @ step {step}]\n Mesh path : {mesh_path} \n {completion}\n", flush=True)
 
 
 # ------------- update original GRPO Trainer class
 from grpo_loss import cppo_compute_loss, adv_select_top_samples
 class TopSampleGRPOTrainer(GRPOTrainer):
     def compute_loss(self, model, inputs, return_outputs=False,  **kwargs):
-        return cppo_compute_loss(self, model, inputs, return_outputs=return_outputs,)
+        return cppo_compute_loss(self, model, inputs, return_outputs=return_outputs, clip_cov=targs.clip_cov)
     # custom loss
     def select_top_samples(self, inputs, num_generations: int, top_samples: int=TOP_SAMPLES):
         return adv_select_top_samples(self, inputs, num_generations, top_samples)
-    # log a few generated samples
-    def _maybe_print_sample(self, completion_ids, every=rargs.gen_sample_steps):
-        step = getattr(self.state, "global_step", 0)
-        if step == 0 or step % every != 0:
-            return
-        tok = getattr(self, "processing_class", None)
-        with torch.no_grad():
-            pad = getattr(tok, "pad_token_id", None)
-            eos_id = tok.tokenizer.eos_token_id
-            c = completion_ids[0].detach().cpu().tolist()
-            out = []
-            for t in c:
-                if t == eos_id:
-                    break                  # stop at first EOS
-                if pad is not None and t == pad:
-                    continue               # skip padding if it exists
-                out.append(t)
-            text = tok.decode(c, skip_special_tokens=True)
-            print(f"\n[SAMPLE @ step {step}]\n{text}\n", flush=True)
-    # patch prepare inputs, otherwise cuts the generated completions by the number of generations, where in our CPPO case we want to keep them
+
     def _prepare_inputs(self, generation_batch):
         self.args.steps_per_generation = 1
         return super()._prepare_inputs(generation_batch)
 
+
 # those parameters will be passed to vllm generation trainer
+bad_words = ["<|image_pad|>", "<|vision_pad|>", "<|vision_start|>", "<|vision_end|>", "<|video_pad|>"]
+ids = [processor.tokenizer.convert_tokens_to_ids(t) for t in bad_words if processor.tokenizer.convert_tokens_to_ids(t) != processor.tokenizer.unk_token_id]
+
 grpo.generation_kwargs = {
-    "bad_words":["<|image_pad|>", "<|vision_pad|>", "<|vision_start|>", "<|vision_end|>"]
+    "bad_words": bad_words,
+    "suppress_tokens": ids,
 }
+
+
+from vllm_client_patch import patch_vllm_group_port
+patch_vllm_group_port(margs.group_port)
 
 trainer = TopSampleGRPOTrainer(
     model=model,
