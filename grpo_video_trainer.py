@@ -9,6 +9,7 @@ from functools import partial
 from pathlib import Path
 from typing import Any, Callable, Optional, Union
 
+from copy import deepcopy
 import datasets
 import torch
 import torch.utils.data
@@ -78,6 +79,7 @@ class VideoTopSampleGRPOTrainer(GRPOTrainer):
         - 
     """
     def __init__(self, top_samples, clip_cov=False, **kwargs):
+        #kwargs[""]
         super().__init__(**kwargs)
         self.top_samples = top_samples
         self.clip_cov = clip_cov
@@ -87,12 +89,8 @@ class VideoTopSampleGRPOTrainer(GRPOTrainer):
         self.model.gradient_checkpointing_enable()
         return cppo_compute_loss(self, model, inputs, return_outputs=return_outputs, clip_cov=self.clip_cov)
     
-    def select_top_samples(self, inputs, num_generations: int, top_samples=4):
+    def select_top_samples(self, inputs, num_generations: int, top_samples):
         return adv_select_top_samples(self, inputs, num_generations, top_samples)
-    """
-    def _prepare_inputs(self, generation_batch):
-        1 = 1
-        return super()._prepare_inputs(generation_batch)"""
 
     @profiling_decorator
     def _get_last_hidden_state(
@@ -136,8 +134,6 @@ class VideoTopSampleGRPOTrainer(GRPOTrainer):
         if "logits_to_keep" in self.model_kwarg_keys:
             # We add 1 to `logits_to_keep` because the last logits of the sequence is later excluded
             model_inputs["logits_to_keep"] = logits_to_keep + 1
-
-        model_inputs["use_cache"] = False  # only used in generation; set False to suppress warnings
 
         last_hidden_state = unwrapped_model.model(**model_inputs).last_hidden_state
         # Exclude the last value: it corresponds to the next token pred
@@ -205,7 +201,7 @@ class VideoTopSampleGRPOTrainer(GRPOTrainer):
                 # We add 1 to `logits_to_keep` because the last logits of the sequence is later excluded
                 model_inputs["logits_to_keep"] = logits_to_keep + 1
 
-            logits = model(**model_inputs, use_cache=False).logits
+            logits = model(**model_inputs).logits
             # Exclude the last value: it corresponds to the next token pred
             logits = logits[:, :-1, :]  # (B, L-1, H)
             # Only keep the last logits_to_keep. For model that support logits_to_keep, this is a no-op.
@@ -256,12 +252,15 @@ class VideoTopSampleGRPOTrainer(GRPOTrainer):
         mode = "train" if self.model.training else "eval"
         batch_size = self.args.per_device_train_batch_size if mode == "train" else self.args.per_device_eval_batch_size
 
-        prompts = [x["prompt"] for x in inputs]
+        repeated_inputs = self.repeat_inputs(inputs)
+        inputs = repeated_inputs
+        prompts_text = [x["prompt"] for x in inputs]
+        
 
         # We don't yet support visual reward models/function, so we keep a copy of the original text-only prompts for
         # later use in the reward computation. If images are present, we insert {"type": "image"} as required by the
         # VLM chat template.
-        original_prompts = copy.deepcopy(prompts)
+        original_prompts = copy.deepcopy(prompts_text)
 
         kwargs = {}
         has_images = "image" in inputs[0]
@@ -273,9 +272,7 @@ class VideoTopSampleGRPOTrainer(GRPOTrainer):
         if has_videos:
             videos = [example.get("video") for example in inputs]
             # ADD TWO FRAMES AS IT IS DONE BY PROCESS VISION INFO OF QWEN UTILS
-            kwargs = {"videos": [[vid, vid] for vid in videos]}
-
-        prompts_text = [example["prompt"] for example in inputs]
+            kwargs = {"videos": [[vid[0], vid[0]] for vid in videos]}
 
         prompt_inputs = self.processing_class(
             text=prompts_text,
@@ -285,8 +282,6 @@ class VideoTopSampleGRPOTrainer(GRPOTrainer):
             add_special_tokens=False,
             **kwargs,
         )
-        print(f"shape of video_grid_thw {prompt_inputs['video_grid_thw'].shape}")
-        print(f"shape of pixel_values {prompt_inputs['pixel_values_videos'].shape}")
         # add modalities for Cadrille
         if has_videos:
             prompt_inputs["is_pc"] = torch.zeros_like(prompt_inputs["pixel_values_videos"], dtype=torch.bool, device=device)
@@ -326,7 +321,6 @@ class VideoTopSampleGRPOTrainer(GRPOTrainer):
                         ordered_set_of_videos = all_videos[:: self.num_generations]
                     else:
                         ordered_set_of_videos = None
-                    print(f"ordered set of videos : {ordered_set_of_videos} ")
                     with profiling_context(self, "vLLM.generate"):
                         completion_ids = self.vllm_client.generate(
                             prompts=ordered_set_of_prompts,
@@ -348,8 +342,8 @@ class VideoTopSampleGRPOTrainer(GRPOTrainer):
                 # corresponding slice.
                 completion_ids = broadcast_object_list(completion_ids, from_process=0)
                 process_slice = slice(
-                    self.accelerator.process_index * len(prompts),
-                    (self.accelerator.process_index + 1) * len(prompts),
+                    self.accelerator.process_index * len(prompts_text),
+                    (self.accelerator.process_index + 1) * len(prompts_text),
                 )
                 completion_ids = completion_ids[process_slice]
             
@@ -370,7 +364,6 @@ class VideoTopSampleGRPOTrainer(GRPOTrainer):
                 unwrapped_model.gradient_checkpointing_disable()
 
                 prompt_inputs["input_ids"], prompt_inputs["attention_mask"] = prompt_ids, prompt_mask
-                prompt_inputs["use_cache"] = True
                 prompt_completion_ids = unwrapped_model.generate(
                     **prompt_inputs, generation_config=self.generation_config, disable_compile=True
                 )
@@ -378,7 +371,7 @@ class VideoTopSampleGRPOTrainer(GRPOTrainer):
             prompt_length = prompt_ids.size(1)
             prompt_ids = prompt_completion_ids[:, :prompt_length]
             completion_ids = prompt_completion_ids[:, prompt_length:]
-
+        
         # Mask everything after the first EOS token
         is_eos = completion_ids == self.eos_token_id
         eos_idx = torch.full((is_eos.size(0),), is_eos.size(1), dtype=torch.long, device=device)
@@ -391,10 +384,12 @@ class VideoTopSampleGRPOTrainer(GRPOTrainer):
         completion_ids_list = [
             [id.item() for id, m in zip(row, mask_row) if m] for row, mask_row in zip(completion_ids, completion_mask)
         ]
+        ### remove special tokens not in base vocabulary
+        if (completion_ids > 151643).any():
+            completion_ids = completion_ids.masked_fill(((completion_ids > 151643).cumsum(dim=1) > 0), self.eos_token_id)
 
         # Sum along sequence dimension (dim=1) to get completion length per sequence, used for logging
         completion_lengths = completion_mask.sum(1)
-
         # If mask_truncated_completions is enabled, zero out truncated completions in completion_mask
         if self.mask_truncated_completions:
             truncated_completions = ~is_eos.any(dim=1)
@@ -435,22 +430,13 @@ class VideoTopSampleGRPOTrainer(GRPOTrainer):
 
             # Compute the per-token log probabilities for the reference model
             ref_per_token_logps = None
-
-                # Decode the generated completions
+        # Decode the generated completions
         completions_text = self.processing_class.batch_decode(completion_ids, skip_special_tokens=True)
-        if is_conversational(inputs[0]):
-            completions = []
-            for prompt, completion in zip(prompts, completions_text):
-                bootstrap = prompt.pop()["content"] if prompt[-1]["role"] == "assistant" else ""
-                completions.append([{"role": "assistant", "content": bootstrap + completion}])
-        else:
-            completions = completions_text
-
+        completions = completions_text
         # Calculate rewards for each reward function. rewards_per_func aggregates rewards across all processes. This is
         # important because rewards will be normalized per group, and completions are distributed. We will later slice
         # rewards_per_func to extract each process's subset.
         rewards_per_func = self._calculate_rewards(inputs, original_prompts, completions, completion_ids_list)
-
         # Apply weights to each reward function's output and sum
         rewards = (rewards_per_func * self.reward_weights.to(device).unsqueeze(0)).nansum(dim=1)
 
@@ -468,8 +454,8 @@ class VideoTopSampleGRPOTrainer(GRPOTrainer):
 
         # Slice to keep only the local part of the data
         process_slice = slice(
-            self.accelerator.process_index * len(prompts),
-            (self.accelerator.process_index + 1) * len(prompts),
+            self.accelerator.process_index * len(prompts_text),
+            (self.accelerator.process_index + 1) * len(prompts_text),
         )
         all_process_advantages = advantages.clone()  # keep the aggregated advantages for logging
         advantages = advantages[process_slice]
@@ -603,6 +589,22 @@ class VideoTopSampleGRPOTrainer(GRPOTrainer):
         else:
             raise NotImplementedError("Can't load sharded model for now")
 
+    def _get_train_sampler(self, dataset=None):
+        return RepeatSampler(
+            data_source=self.train_dataset,
+            mini_repeat_count=1, # override trainer RepeatSampler to manually repeat
+            batch_size=self.args.generation_batch_size // self.num_generations,
+            repeat_count=self.num_iterations * self.args.steps_per_generation,
+            shuffle=self.shuffle_dataset,
+            seed=self.args.seed,
+        )
+
+    def repeat_inputs(self, inputs):
+    # Manually repeat inputs on every device
+        return [deepcopy(d) for d in inputs for _ in range(self.num_generations)]
+
+
+        
 def _remap_qwen2vl_keys(sd):
     import re
     f = lambda k: re.sub(r"^model(?!\.(language_model|visual))\.", "model.language_model.",

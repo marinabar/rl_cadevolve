@@ -78,9 +78,6 @@ def patch_vllm_for_videos():
 
         # Convert PIL images to base64 strings
         images = [pil_to_base64(img) for img in images] if images else None
-        one_frame = videos[0][0]
-        print(f"saving the first frame of the passed videos")
-        one_frame.save(f"logs/images/first_frame_test_{id(one_frame)}.png")
         videos = [[pil_to_base64(frame) for frame in frames] for frames in videos] if videos else None
         response = self.session.post(
             url,

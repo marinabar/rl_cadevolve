@@ -12,34 +12,7 @@ import base64, pickle, json, signal, select
 import numpy as np
 import faulthandler
 
-faulthandler.enable()
 
-"""
-# for rendering only
-from dataset_utils import render_mesh
-import trimesh
-from PIL import Image, ImageOps
-import skimage
-import open3d
-
-def save_mesh_render(mesh, filename=None,
-                     camera_distance=-1.8, front=[1, 1, 1],
-                     width=500, height=500, img_size=128):
-    os.makedirs("renders", exist_ok=True)
-    if filename is None:
-        timestamp = time.time()
-        filename = f"render_{timestamp}.png"
-    path = os.path.join("renders", filename)
-    vertices = np.asarray(mesh.vertices)
-    faces = np.asarray(mesh.faces)
-    mesh = open3d.geometry.TriangleMesh()
-    mesh.vertices = open3d.utility.Vector3dVector(vertices)
-    mesh.triangles = open3d.utility.Vector3iVector(faces)
-    mesh.paint_uniform_color(np.array([255, 255, 136]) / 255.0)
-    mesh.compute_vertex_normals()
-    img = render_mesh(mesh, camera_distance, front, width, height, img_size)
-    img.save(path)
-    return path"""
 
 class NonDaemonProcess(Process):
     def _get_daemon(self):
@@ -127,7 +100,7 @@ def compute_normals_metrics(gt_mesh, pred_mesh, tol=1, n_points=8192, visualize=
 
     nb_invalid = n_points - len(valid_pred_normals)
     per_invalid = nb_invalid / n_points * 100
-    print(f"Number of points with no neighbors within tol: {nb_invalid} out of {n_points} ({per_invalid:.2f}%)")
+    #print(f"Number of points with no neighbors within tol: {nb_invalid} out of {n_points} ({per_invalid:.2f}%)")
 
     
     
@@ -275,17 +248,14 @@ def get_metrics_from_single_text(text, gt_file, n_points, nc_params=None, var_na
     cd, iou, auc = None, None, None
     try: 
         gt_mesh = trimesh.load_mesh(gt_file)
-
-        #gt_mesh = transform_gt_mesh(gt_mesh)
-        gt_mesh = transform_gt_mesh_cad_recodev2(gt_mesh)
-        #print(f"normalized gt_meshes extents : {gt_mesh.extents}")
-        #print("Loaded and normalized ground truth", flush=True)
+        gt_mesh = transform_gt_mesh(gt_mesh)
+        #gt_mesh = transform_gt_mesh_cad_recodev2(gt_mesh)
         
         pred_mesh = transform_pred_mesh(pred_mesh)
         #print(f"normalized pred_mesh extents : {pred_mesh.extents}")
         #print("Normalizing prediction", flush=True) 
 
-        #save_mesh_render(pred_mesh)
+        #(pred_mesh)
 
         cd = compute_cd(gt_mesh, pred_mesh, n_points)
         try:
@@ -441,8 +411,10 @@ def get_metrics_from_texts(texts, meshes, nc_params=None, max_workers=None, var_
         (text, gt, n_points, nc_params, var_name)
         for text, gt in zip(texts, meshes)
     ]
+    #print(f"meshes : {meshes}")
     async_results = [POOL.apply_async(timed_process_text, args=(arg,)) for arg in args]
     results = []
+
     for res in async_results:
         output = res.get()
         if output == "__TIMEOUT__" or output == "__CRASH__":

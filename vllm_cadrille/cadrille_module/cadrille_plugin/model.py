@@ -52,18 +52,9 @@ class CadrilleForCausalLM(Qwen2VLForConditionalGeneration):
             positions: torch.Tensor,
             intermediate_tensors = None,
             inputs_embeds = None, **kwargs):   
-                
-        
-        if input_ids is not None:
-            B, device = input_ids.size(0), input_ids.device
-        elif inputs_embeds is not None:
-            B, device = inputs_embeds.size(0), inputs_embeds.device
-
-        if "is_img" not in kwargs or kwargs["is_img"] is None:
-            kwargs["is_img"] = torch.ones(B, dtype=torch.bool, device=device)
-        if "is_pc" not in kwargs or kwargs["is_pc"] is None:
-            kwargs["is_pc"] = torch.zeros(B, dtype=torch.bool, device=device)
-
+            
+        if "video_grid_thw" in kwargs:
+            print(kwargs["video_grid_thw"][0])
         if intermediate_tensors is not None:
             inputs_embeds = None
 
@@ -83,16 +74,6 @@ class CadrilleForCausalLM(Qwen2VLForConditionalGeneration):
                     image_input=image_input,
                     video_input=video_input)
                 input_ids = None
-
-        
-                
-        """
-        if is_pc.sum() > 0 and (past_key_values is None or past_key_values.get_seq_length() == 0):
-            point_embeds = self.point_encoder(point_clouds.float()).bfloat16()
-            start_idxs = attention_mask.shape[1] - attention_mask.sum(axis=1)
-            for i, start_idx in enumerate(start_idxs):
-                if is_pc[i]:
-                    inputs_embeds[i, start_idx:start_idx + point_embeds.shape[1], :] = point_embeds[i]"""
 
         hidden_states = self.language_model.model(
             input_ids=input_ids,

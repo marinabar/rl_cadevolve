@@ -1,5 +1,5 @@
 # vLLM client code updated for videos, adapted from https://github.com/huggingface/trl/blob/v0.21.0/trl/scripts/vllm_serve.py
-# only modified generate method from main()
+# only modified generate method from main() and added custom cuda graph sizes
 
 
 
@@ -38,7 +38,7 @@ from trl.import_utils import (
 )
 from transformers import is_vision_available
 
-from trl.scripts.vllm_serve import WeightSyncWorkerExtension, ScriptArguments, llm_worker, chunk_list
+from trl.scripts.vllm_serve import WeightSyncWorkerExtension, ScriptArguments, chunk_list
 if is_fastapi_available():
     from fastapi import FastAPI
 
@@ -73,6 +73,57 @@ logger = logging.getLogger(__name__)
 # error: RuntimeError: Cannot re-initialize CUDA in forked subprocess. To use CUDA with multiprocessing, you must use
 # the 'spawn' start method
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
+
+
+def llm_worker(
+    script_args, data_parallel_rank: int, master_port: int, connection) -> None:
+    # Set required environment variables for DP to work with vLLM
+    os.environ["VLLM_DP_RANK"] = str(data_parallel_rank)
+    os.environ["VLLM_DP_RANK_LOCAL"] = str(data_parallel_rank)
+    os.environ["VLLM_DP_SIZE"] = str(script_args.data_parallel_size)
+    os.environ["VLLM_DP_MASTER_PORT"] = str(master_port)
+
+    llm = LLM(
+        model=script_args.model,
+        revision=script_args.revision,
+        tensor_parallel_size=script_args.tensor_parallel_size,
+        gpu_memory_utilization=script_args.gpu_memory_utilization,
+        enforce_eager=script_args.enforce_eager,
+        dtype=script_args.dtype,
+        # Automatic Prefix Caching caches the KV cache of existing queries, so that a new query can
+        # directly reuse the KV cache if it shares the same prefix with one of the existing queries.
+        # This is particularly useful here because we generate completions from the same prompts.
+        enable_prefix_caching=script_args.enable_prefix_caching,
+        kv_cache_dtype=script_args.kv_cache_dtype,
+        max_model_len=script_args.max_model_len,
+        worker_extension_cls="trl.scripts.vllm_serve.WeightSyncWorkerExtension",
+        trust_remote_code=script_args.trust_remote_code,
+        model_impl=script_args.vllm_model_impl,
+        cuda_graph_sizes=[1536, 896, 768, 256, 128, 64, 32, 16, 8, 4, 2, 1]
+    )
+
+    # Send ready signal to parent process
+    connection.send({"status": "ready"})
+
+    while True:
+        # Wait for commands from the parent process
+        try:
+            command = connection.recv()
+        except KeyboardInterrupt:
+            llm.collective_rpc(method="close_communicator")
+            break
+
+        # Handle commands
+        if command["type"] in ["call", "fire_and_forget"]:
+            method_name = command["method"]
+            args, kwargs = command.get("args", ()), command.get("kwargs", {})
+            method = getattr(llm, method_name)
+            result = method(*args, **kwargs)
+            if command["type"] == "call":
+                connection.send(result)
+        elif command["type"] == "shutdown":
+            break
+
 
 
 def main(script_args: ScriptArguments):
