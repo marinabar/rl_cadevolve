@@ -1,12 +1,20 @@
 # RL Fine-Tuning for CADEvolve
 
+<img width="1831" height="384" alt="CADEvolve Gallery_page-0001" src="https://github.com/user-attachments/assets/924881ef-4f7d-4d7c-ac71-01b983d1727d" />
+
+
+
 This repository contains the **GRPO-based reinforcement learning fine-tuning** code used in the paper:
 
 > **CADEvolve: Creating Realistic CAD via Program Evolution**  
 > Maksim Elistratov, Marina Barannikov, Gregory Ivanov, Valentin Khrulkov, Anton Konushin, Andrey Kuznetsov, Dmitrii Zhemchuzhnikov  
-> arXiv:2602.16317 · [Paper](https://arxiv.org/abs/2602.16317)
+> arXiv:2602.16317 · [arXiv](https://arxiv.org/abs/2602.16317)
 
-The pipeline fine-tunes a **Qwen2-VL** vision-language model to generate executable [CadQuery](https://cadquery.readthedocs.io/) Python programs from multi-view renders of 3-D shapes, using geometry-aware rewards (IoU, Chamfer Distance, normal AUC) computed on-the-fly.
+The pipeline fine-tunes a **Qwen2-VL** vision-language model to generate executable [CadQuery](https://cadquery.readthedocs.io/) Python programs from multi-view renders of 3-D shapes, using geometry-aware rewards (IoU, Chamfer Distance, normal AUC).
+
+<p align="center">
+  <img width="300" alt="CADEvolve-M-1" src="https://github.com/user-attachments/assets/2003687a-c75c-4407-8fba-d8d38fa9b60f" />
+</p>
 
 ---
 
@@ -43,11 +51,24 @@ Instead of updating on all `G` generated completions per prompt, `TopSampleGRPOT
 
 The clipped PPO objective follows the standard GRPO formulation:
 
-\[
-\mathcal{L} = -\mathbb{E}\left[\min\!\left(\rho_t A_t,\; \text{clip}(\rho_t,\, 1-\varepsilon_{\text{low}},\, 1+\varepsilon_{\text{high}}) A_t\right)\right]
-\]
+$$
+\mathcal{L}
+= -\mathbb{E}\left[
+\min\left(
+\rho_t A_t,\;
+\mathrm{clip}\left(\rho_t, 1-\varepsilon_{\mathrm{low}}, 1+\varepsilon_{\mathrm{high}}\right) A_t
+\right)
+\right],
+$$
 
-where \(\rho_t = \exp(\log\pi_\theta - \log\pi_{\text{old}})\) is the per-token probability ratio.
+where
+
+$$
+\rho_t = \exp\left(\log \pi_\theta - \log \pi_{\mathrm{old}}\right)
+$$
+
+is the per-token probability ratio.<img width="680" height="506" alt="CADEvolve-M-1" src="https://github.com/user-attachments/assets/a0ab1bce-28cb-45f2-a474-aef453330d9a" />
+
 
 ---
 
